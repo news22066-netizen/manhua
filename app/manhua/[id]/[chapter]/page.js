@@ -1,330 +1,119 @@
 import Link from 'next/link';
 import { notFound } from 'next/navigation';
-import { createClient } from '@supabase/supabase-js';
+import { supabase } from '@/lib/supabase';
+import { proxied } from '@/lib/proxy';
+import ThemeToggle from '@/components/ThemeToggle';
 
-// Page image URLs from MangaDex expire, so this page must never be cached.
+// The at-home base URL / tokens are temporary, so this page must be rendered per request.
 export const dynamic = 'force-dynamic';
 
-const MANHUA_TABLE = 'manga';
-const CHAPTERS_TABLE = 'chapters';
-const WORKER_URL = process.env.NEXT_PUBLIC_WORKER_URL;
-const CHAPTER_PAGE_SIZE = 1000; // Supabase returns at most 1000 rows per request
-const AT_HOME_URL = 'https://api.mangadex.org/at-home/server';
-
-function getSupabase() {
-  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
-  if (!url || !key) {
-    throw new Error(
-      'Missing NEXT_PUBLIC_SUPABASE_URL or NEXT_PUBLIC_SUPABASE_ANON_KEY environment variables.'
-    );
-  }
-  return createClient(url, key, { auth: { persistSession: false } });
-}
-
-function safeDecode(value) {
-  try {
-    return decodeURIComponent(value);
-  } catch {
-    return value;
-  }
-}
-
-// Numeric chapter numbers sort numerically (2 before 10); text ones go last.
-function compareChapterNumbers(a, b) {
-  const aText = String(a).trim();
-  const bText = String(b).trim();
-  const aNum = Number(aText);
-  const bNum = Number(bText);
-  const aIsNum = aText !== '' && Number.isFinite(aNum);
-  const bIsNum = bText !== '' && Number.isFinite(bNum);
-
-  if (aIsNum && bIsNum) return aNum - bNum;
-  if (aIsNum) return -1;
-  if (bIsNum) return 1;
-  return aText.localeCompare(bText);
-}
-
-async function fetchAllChapters(supabase, manhuaId) {
-  const all = [];
-  let from = 0;
-
-  while (true) {
-    const { data, error } = await supabase
-      .from(CHAPTERS_TABLE)
-      .select('chapter_number, title, source_chapter_id')
-      .eq('manhua_id', manhuaId)
-      .order('chapter_number', { ascending: true })
-      .range(from, from + CHAPTER_PAGE_SIZE - 1);
-
-    if (error) {
-      throw new Error(`Could not load chapters: ${error.message}`);
-    }
-
-    const rows = data || [];
-    all.push(...rows);
-
-    if (rows.length < CHAPTER_PAGE_SIZE) break;
-    from += CHAPTER_PAGE_SIZE;
-  }
-
-  return all.sort((a, b) => compareChapterNumbers(a.chapter_number, b.chapter_number));
-}
-
-// Asks MangaDex where this chapter's page images live and returns their URLs.
-async function fetchPageImageUrls(sourceChapterId) {
-  const res = await fetch(`${AT_HOME_URL}/${sourceChapterId}`, {
-    headers: {
-      'User-Agent': 'manhua-reader/1.0',
-      Accept: 'application/json',
-    },
+/** Resolves page image URLs server-side from MangaDex's at-home API. */
+async function resolvePages(sourceChapterId, quality) {
+  const res = await fetch(`https://api.mangadex.org/at-home/server/${sourceChapterId}`, {
     cache: 'no-store',
+    headers: { 'User-Agent': 'ManhuaReader/1.0 (personal project)' },
   });
-
-  if (!res.ok) {
-    throw new Error(`MangaDex responded with HTTP ${res.status}`);
-  }
-
-  const json = await res.json();
-  const baseUrl = json && json.baseUrl;
-  const chapter = (json && json.chapter) || {};
-  const hash = chapter.hash;
-
-  if (!baseUrl || !hash) {
-    throw new Error('MangaDex returned no image server for this chapter.');
-  }
-
-  let folder = 'data';
-  let files = Array.isArray(chapter.data) ? chapter.data : [];
-
-  if (files.length === 0 && Array.isArray(chapter.dataSaver)) {
-    folder = 'data-saver';
-    files = chapter.dataSaver;
-  }
-
-  return files.map((fileName) => `${baseUrl}/${folder}/${hash}/${fileName}`);
+  if (!res.ok) return null;
+  const { baseUrl, chapter } = await res.json();
+  const useHigh = quality === 'high' || !chapter.dataSaver?.length;
+  const dir = useHigh ? 'data' : 'data-saver';
+  const files = useHigh ? chapter.data : chapter.dataSaver;
+  return files.map((f) => `${baseUrl}/${dir}/${chapter.hash}/${f}`);
 }
 
-function chapterHref(manhuaId, chapterNumber) {
-  return `/manhua/${manhuaId}/${encodeURIComponent(chapterNumber)}`;
+export async function generateMetadata({ params }) {
+  const { id, chapter } = await params;
+  const { data } = await supabase.from('manhuas').select('title').eq('id', id).single();
+  return { title: data ? `${data.title} – Chapter ${chapter}` : 'Reader' };
 }
 
-const css = `
-  body {
-    margin: 0;
-    background: #0b0d12;
-  }
-  .page {
-    min-height: 100vh;
-    background: #0b0d12;
-    color: #e8eaf0;
-    font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
-  }
-  .topbar {
-    position: sticky;
-    top: 0;
-    z-index: 10;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 12px;
-    padding: 10px 16px;
-    background: rgba(11, 13, 18, 0.92);
-    backdrop-filter: blur(8px);
-    border-bottom: 1px solid #1f2533;
-  }
-  .topbar-title {
-    flex: 1;
-    min-width: 0;
-    text-align: center;
-  }
-  .topbar-title .name {
-    font-size: 15px;
-    font-weight: 700;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .topbar-title .chapter {
-    font-size: 12px;
-    color: #8a91a5;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .link {
-    color: #8aa4ff;
-    text-decoration: none;
-    font-size: 14px;
-    white-space: nowrap;
-  }
-  .link:hover {
-    text-decoration: underline;
-  }
-  .reader {
-    max-width: 820px;
-    margin: 0 auto;
-    background: #000;
-  }
-  .panel {
-    display: block;
-    width: 100%;
-    height: auto;
-    margin: 0;
-  }
-  .nav {
-    display: flex;
-    justify-content: center;
-    gap: 12px;
-    flex-wrap: wrap;
-    padding: 24px 16px 56px;
-  }
-  .button {
-    display: inline-block;
-    padding: 12px 20px;
-    border-radius: 10px;
-    font-size: 15px;
-    font-weight: 600;
-    text-decoration: none;
-    background: #6c8cff;
-    color: #0b0d12;
-  }
-  .button.secondary {
-    background: #151922;
-    color: #e8eaf0;
-    border: 1px solid #262c3a;
-  }
-  .button.disabled {
-    opacity: 0.35;
-    pointer-events: none;
-  }
-  .message {
-    text-align: center;
-    color: #8a91a5;
-    padding: 64px 20px;
-  }
-  .error {
-    color: #ff8a8a;
-  }
-`;
-
-function ChapterNav({ manhuaId, prev, next }) {
+function NavBar({ id, prev, next, quality, num }) {
+  const btn =
+    'rounded-md px-4 py-2 text-sm font-semibold transition';
+  const on = `${btn} bg-accent text-black hover:bg-accent-bright`;
+  const off = `${btn} cursor-not-allowed border border-neutral-300 text-neutral-400 dark:border-neutral-700 dark:text-neutral-600`;
+  const q = quality === 'high' ? '?quality=high' : '';
   return (
-    <div className="nav">
-      {prev ? (
-        <Link className="button secondary" href={chapterHref(manhuaId, prev.chapter_number)}>
-          &larr; Chapter {prev.chapter_number}
-        </Link>
-      ) : (
-        <span className="button secondary disabled">&larr; Previous</span>
-      )}
-      <Link className="button secondary" href={`/manhua/${manhuaId}`}>
-        All chapters
-      </Link>
-      {next ? (
-        <Link className="button" href={chapterHref(manhuaId, next.chapter_number)}>
-          Chapter {next.chapter_number} &rarr;
-        </Link>
-      ) : (
-        <span className="button disabled">Next &rarr;</span>
-      )}
+    <div className="flex items-center justify-between gap-2">
+      {prev ? <Link href={`/manhua/${id}/${prev.chapter_number}${q}`} className={on}>Prev</Link> : <span className={off}>Prev</span>}
+      <Link href={`/manhua/${id}`} className="truncate text-sm font-medium hover:text-accent">Chapter {num} · all chapters</Link>
+      {next ? <Link href={`/manhua/${id}/${next.chapter_number}${q}`} className={on}>Next</Link> : <span className={off}>Next</span>}
     </div>
   );
 }
 
-export default async function ChapterReaderPage({ params }) {
-  const resolved = await params;
-  const manhuaId = resolved.id;
-  const chapterNumber = safeDecode(resolved.chapter);
-  const supabase = getSupabase();
+export default async function ReaderPage({ params, searchParams }) {
+  const { id, chapter } = await params;
+  const sp = await searchParams;
+  const quality = sp?.quality === 'high' ? 'high' : 'saver';
+  const num = Number(chapter);
+  if (Number.isNaN(num)) notFound();
 
-  const { data: manhua, error: manhuaError } = await supabase
-    .from(MANHUA_TABLE)
-    .select('id, title')
-    .eq('id', manhuaId)
+  const { data: ch } = await supabase
+    .from('chapters')
+    .select('chapter_number, source_chapter_id, manhuas(title)')
+    .eq('manhua_id', id)
+    .eq('chapter_number', num)
     .maybeSingle();
+  if (!ch) notFound();
 
-  if (manhuaError) {
-    throw new Error(`Could not load manhua: ${manhuaError.message}`);
-  }
-  if (!manhua) {
-    notFound();
-  }
-
-  const chapters = await fetchAllChapters(supabase, manhuaId);
-  const index = chapters.findIndex(
-    (chapter) => String(chapter.chapter_number) === chapterNumber
-  );
-
-  if (index === -1) {
-    notFound();
-  }
-
-  const current = chapters[index];
-  const prev = index > 0 ? chapters[index - 1] : null;
-  const next = index < chapters.length - 1 ? chapters[index + 1] : null;
-
-  let imageUrls = [];
-  let loadError = '';
-
-  try {
-    imageUrls = await fetchPageImageUrls(current.source_chapter_id);
-    if (imageUrls.length === 0) {
-      loadError = 'This chapter has no readable pages.';
-    }
-  } catch (err) {
-    loadError = `Could not load pages: ${err.message}`;
-  }
+  const [{ data: prevRows }, { data: nextRows }, pages] = await Promise.all([
+    supabase.from('chapters').select('chapter_number').eq('manhua_id', id).lt('chapter_number', num).order('chapter_number', { ascending: false }).limit(1),
+    supabase.from('chapters').select('chapter_number').eq('manhua_id', id).gt('chapter_number', num).order('chapter_number', { ascending: true }).limit(1),
+    resolvePages(ch.source_chapter_id, quality),
+  ]);
+  const prev = prevRows?.[0];
+  const next = nextRows?.[0];
 
   return (
-    <div className="page">
-      <style>{css}</style>
-
-      <div className="topbar">
-        <Link className="link" href={`/manhua/${manhuaId}`}>
-          &larr; Chapters
-        </Link>
-        <div className="topbar-title">
-          <div className="name">{manhua.title}</div>
-          <div className="chapter">
-            Chapter {current.chapter_number}
-            {current.title && current.title !== `Chapter ${current.chapter_number}`
-              ? ` - ${current.title}`
-              : ''}
+    <div className="bg-white text-black dark:bg-black dark:text-white">
+      <div className="sticky top-0 z-20 border-b border-neutral-200 bg-white/95 backdrop-blur dark:border-neutral-800 dark:bg-black/95">
+        <div className="mx-auto flex max-w-3xl items-center gap-3 px-3 py-2">
+          <div className="min-w-0 flex-1">
+            <NavBar id={id} prev={prev} next={next} quality={quality} num={ch.chapter_number} />
           </div>
+          <ThemeToggle />
         </div>
-        <Link className="link" href="/home">
-          Library
-        </Link>
       </div>
 
-      {!WORKER_URL && (
-        <div className="message error">
-          NEXT_PUBLIC_WORKER_URL is not set, so page images cannot load.
-        </div>
-      )}
+      <main className="mx-auto max-w-3xl">
+        <h1 className="px-4 py-4 text-center text-sm font-semibold text-neutral-500">
+          {ch.manhuas?.title} — Chapter {ch.chapter_number}
+        </h1>
 
-      {loadError ? (
-        <div className="message error">{loadError}</div>
-      ) : (
-        WORKER_URL && (
-          <div className="reader">
-            {imageUrls.map((remoteUrl, i) => (
+        {!pages ? (
+          <div className="px-4 py-24 text-center">
+            <p className="font-semibold">This chapter&apos;s images could not be loaded.</p>
+            <p className="mt-1 text-sm text-neutral-500">The image server may be busy. Reload to try again.</p>
+          </div>
+        ) : (
+          <div className="flex flex-col">
+            {pages.map((url, i) => (
               // eslint-disable-next-line @next/next/no-img-element
               <img
-                className="panel"
-                key={remoteUrl}
-                src={`${WORKER_URL}?url=${encodeURIComponent(remoteUrl)}`}
+                key={url}
+                src={proxied(url)}
                 alt={`Page ${i + 1}`}
-                loading={i < 3 ? 'eager' : 'lazy'}
+                loading={i < 2 ? 'eager' : 'lazy'}
+                fetchPriority={i === 0 ? 'high' : 'auto'}
                 decoding="async"
+                className="block h-auto min-h-[40vh] w-full bg-neutral-100 dark:bg-neutral-900"
               />
             ))}
           </div>
-        )
-      )}
+        )}
 
-      <ChapterNav manhuaId={manhuaId} prev={prev} next={next} />
+        <div className="px-3 py-8">
+          <NavBar id={id} prev={prev} next={next} quality={quality} num={ch.chapter_number} />
+          <p className="mt-4 text-center text-xs text-neutral-500">
+            {quality === 'high' ? (
+              <Link href={`/manhua/${id}/${chapter}`} className="underline hover:text-accent">Switch to data saver</Link>
+            ) : (
+              <Link href={`/manhua/${id}/${chapter}?quality=high`} className="underline hover:text-accent">Switch to high quality</Link>
+            )}
+          </p>
+        </div>
+      </main>
     </div>
   );
 }
