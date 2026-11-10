@@ -62,10 +62,17 @@ export async function GET(request) {
     upstream = await fetch(target.toString(), {
       // Modern browser User-Agent + Referer that matches the target domain.
       headers: { ...BROWSER_HEADERS, Referer: `${target.origin}/` },
-      redirect: 'error', // never follow redirects to non-allowlisted hosts
+      // 🚀 FIX: Changed from 'error' to 'manual' to stop the Vercel Edge runtime crash!
+      redirect: 'manual', 
     });
   } catch {
     return new Response('Upstream unreachable', { status: 502, headers: { 'Cache-Control': 'no-store' } });
+  }
+
+  // 🚀 EXTRA EDGE PROTECTION: Since we use 'manual', if MangaDex attempts a redirect (status 301/302),
+  // we catch it right here and reject it safely to maintain absolute security bounds.
+  if (upstream.status >= 300 && upstream.status < 400) {
+    return new Response('Upstream redirection blocked for security', { status: 403, headers: { 'Cache-Control': 'no-store' } });
   }
 
   // Never let errors get cached as "immutable".
@@ -85,6 +92,9 @@ export async function GET(request) {
     'Content-Type': type,
     'Cache-Control': IMMUTABLE,
     'X-Content-Type-Options': 'nosniff',
+    // 🚀 CORS HEADERS: Added cross-origin sharing access to guarantee browser canvas loading compatibility
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, OPTIONS',
   });
   const len = upstream.headers.get('content-length');
   if (len) headers.set('Content-Length', len);
